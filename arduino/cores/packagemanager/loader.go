@@ -323,6 +323,14 @@ func (pm *PackageManager) loadPlatformRelease(platform *cores.PlatformRelease, p
 
 	if platform.Properties.SubTree("discovery").Size() > 0 {
 		platform.PluggableDiscoveryAware = true
+
+		discoveries, err := pm.LoadDiscoveries(platform)
+		if err != nil {
+			return fmt.Errorf("loading discovery properties: %s", err)
+		}
+		for _, discovery := range discoveries {
+			pm.discoveryManager.Add(discovery)
+		}
 	}
 
 	if platform.Platform.Name == "" {
@@ -590,4 +598,84 @@ func (pm *PackageManager) LoadToolsFromBundleDirectory(toolsPath *paths.Path) er
 		pm.loadToolsFromPackage(unnamedPackage, toolsPath)
 	}
 	return nil
+}
+
+// LoadDiscoveries returns a list of PluggableDiscoveries supported by the specfied PlatformRelease.
+// Returns error if:
+// * A PluggableDiscovery instance can't be created
+// * Tools required by the PlatformRelease cannot be found
+// * Command line to start PluggableDiscovery has malformed or mismatched quotes
+func (pm *PackageManager) LoadDiscoveries(release *cores.PlatformRelease) ([]*discovery.PluggableDiscovery, error) {
+	res := []*discovery.PluggableDiscovery{}
+	discoveryProperties := release.Properties.SubTree("discovery").Clone()
+
+	if discoveryProperties.Size() == 0 {
+		return res, nil
+	}
+
+	// Handles discovery properties formatted like so:
+	//
+	// Case 1:
+	//    "discovery.required": "PLATFORM:DISCOVERY_NAME",
+	//
+	// Case 2:
+	//    "discovery.required.0": "PLATFORM:DISCOVERY_ID_1",
+	//    "discovery.required.1": "PLATFORM:DISCOVERY_ID_2",
+	//
+	// If both indexed and unindexed properties are found the unindexed are ignored
+	for _, id := range discoveryProperties.ExtractSubIndexLists("required") {
+		tool := release.Platform.Package.Tools[id]
+		toolRelease := tool.GetLatestInstalled()
+		discoveryPath := toolRelease.InstallDir.Join(tool.Name).String()
+		d, err := discovery.New(id, discoveryPath)
+		if err != nil {
+			return nil, fmt.Errorf("creating discovery: %s", err)
+		}
+		res = append(res, d)
+	}
+
+	// "discovery.teensy.pattern": "\"{runtime.tools.teensy_ports.path}/hardware/tools/teensy_ports\" -J2",
+	discoveryIDs := discoveryProperties.FirstLevelOf()
+	delete(discoveryIDs, "required")
+	// Get the list of tools only we if have there are discoveries that use Direct discovery integration.
+	// See:
+	// https://github.com/arduino/tooling-rfcs/blob/main/RFCs/0002-pluggable-discovery.md#direct-discovery-integration-not-recommended
+	// We need the tools only in that case since we might need some tool's
+	// runtime properties to expand the discovery pattern to run it correctly.
+	var tools []*cores.ToolRelease
+	if len(discoveryIDs) > 0 {
+		var err error
+		tools, err = pm.FindToolsRequiredFromPlatformRelease(release)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Handles discovery properties formatted like so:
+	//
+	// discovery.DISCOVERY_ID.pattern: "COMMAND_TO_EXECUTE"
+	for discoveryID, props := range discoveryIDs {
+		pattern, ok := props.GetOk("pattern")
+		if !ok {
+			return nil, fmt.Errorf("can't find pattern for discovery with id %s", discoveryID)
+		}
+		configuration := release.Properties.Clone()
+		configuration.Merge(release.RuntimeProperties())
+		configuration.Merge(props)
+
+		for _, tool := range tools {
+			configuration.Merge(tool.RuntimeProperties())
+		}
+
+		cmd := configuration.ExpandPropsInString(pattern)
+		if cmdArgs, err := properties.SplitQuotedString(cmd, `"'`, true); err != nil {
+			return nil, err
+		} else if d, err := discovery.New(discoveryID, cmdArgs...); err != nil {
+			return nil, err
+		} else {
+			res = append(res, d)
+		}
+	}
+
+	return res, nil
 }
